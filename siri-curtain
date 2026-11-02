@@ -1,0 +1,176 @@
+#!/bin/sh
+''''exec "$(dirname -- "$0")/.venv/bin/python" "$0" "$@" #'''
+"""Local entry point for iPhone Shortcuts (Run Script over SSH).
+
+The shell line above re-executes this file with the project's .venv Python.
+"""
+import argparse
+import asyncio
+import json
+import os
+from pathlib import Path
+import socket
+from datetime import datetime
+import time
+
+CONFIG = Path.home() / ".config/mijia-curtain-ble"
+SOCKET = CONFIG / "control.sock"
+
+
+def load_device():
+    """This Mac's CoreBluetooth address and the curtain MAC.
+
+    From env CURTAIN_ADDRESS / CURTAIN_MAC, else ~/.config/mijia-curtain-ble/device.json
+    ({"address": "...", "mac": "..."}).
+    """
+    address, mac = os.environ.get("CURTAIN_ADDRESS"), os.environ.get("CURTAIN_MAC")
+    if not (address and mac):
+        try:
+            config = json.loads((CONFIG / "device.json").read_text())
+        except FileNotFoundError:
+            raise ValueError("缺少设备配置：设置 CURTAIN_ADDRESS/CURTAIN_MAC 或创建 "
+                             "~/.config/mijia-curtain-ble/device.json") from None
+        address, mac = address or config["address"], mac or config["mac"]
+    return address, mac.upper()
+
+
+async def ensure_open(curtain, state=None):
+    if state is None:
+        state = await asyncio.wait_for(curtain.status(), 15)
+    position = state.get("position")
+    if type(position) not in (int, float) or not 0 <= position <= 100:
+        raise ValueError("无法确认窗帘位置，未发送打开指令")
+    if position == 100:
+        return "窗帘已完全打开，无需操作"
+    # Send at most once. A timeout must not trigger a retry.
+    await asyncio.wait_for(curtain.open(), 15)
+    return f"窗帘位置 {position}%，已发送一次打开指令"
+
+
+async def run(command):
+    # Only the locally started server imports and uses CoreBluetooth.
+    from mibleak.client import MiMeshDevice
+    from mibleak.curtain import Curtain
+    from bleak.exc import BleakError
+    address, mac = load_device()
+    records = json.loads((CONFIG / "ltmk.json").read_text())
+    record = next((d for d in records if d.get("mac", "").upper() == mac), None)
+    if record is None:
+        raise ValueError("密钥文件中没有这台窗帘，请重新获取密钥")
+    for attempt in range(1, 4):
+        if attempt > 1:
+            await asyncio.sleep(5)
+        dev = MiMeshDevice(address, bytes.fromhex(record["gatt_ltmk"]))
+        stage = "连接/认证"
+        started = time.monotonic()
+
+        def log_stage(message):
+            print(f"{datetime.now().astimezone().isoformat(timespec='seconds')} "
+                  f"{command} 尝试 {attempt}/3 {stage} "
+                  f"耗时 {time.monotonic() - started:.1f}s {message}", flush=True)
+
+        try:
+            log_stage("开始")
+            await asyncio.wait_for(dev.connect(), 40)
+            log_stage("成功")
+            curtain = Curtain(dev)
+            if command in ("ensure-open", "status"):
+                stage = "读取状态"
+                started = time.monotonic()
+                state = await asyncio.wait_for(curtain.status(), 15)
+                log_stage("成功")
+                if command == "status":
+                    return json.dumps(state, ensure_ascii=False)
+            # No retry is allowed beyond this boundary: a timed-out write may
+            # already have reached the device.
+            stage = "控制指令"
+            started = time.monotonic()
+            if command == "ensure-open":
+                result = await ensure_open(curtain, state)
+            else:
+                await asyncio.wait_for(getattr(curtain, command)(), 15)
+                result = "已发送打开窗帘指令" if command == "open" else "已发送关闭窗帘指令"
+            log_stage(result)
+            return result
+        except (TimeoutError, BleakError) as exc:
+            log_stage(f"失败 {type(exc).__name__}: {exc}")
+            if stage == "控制指令":
+                raise
+            if attempt == 3:
+                raise RuntimeError(f"{stage}失败，已尝试 3 次，未发送控制指令：{type(exc).__name__}") from exc
+        finally:
+            # Finish disconnecting before retrying with a fresh BLE session.
+            await asyncio.wait_for(dev.disconnect(), 5)
+
+
+async def serve():
+    import fcntl
+    SOCKET.parent.mkdir(parents=True, exist_ok=True)
+    with (SOCKET.parent / "control.lock").open("w") as lockfile:
+        try:
+            fcntl.flock(lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("本地窗帘服务已经运行") from None
+        SOCKET.unlink(missing_ok=True)
+        busy = asyncio.Lock()
+
+        async def handle(reader, writer):
+            try:
+                command = (await asyncio.wait_for(reader.readline(), 5)).decode().strip()
+                if command not in ("open", "close", "status", "ensure-open"):
+                    raise ValueError("只支持 open、close、status、ensure-open")
+                if busy.locked():
+                    raise ValueError("窗帘正在处理上一条请求，请稍后重试")
+                async with busy:
+                    result = {"ok": True, "message": await run(command)}
+            except Exception as exc:
+                result = {"ok": False, "message": f"{type(exc).__name__}: {exc}"}
+            try:
+                writer.write((json.dumps(result, ensure_ascii=False) + "\n").encode())
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        # Unix socket only: no LAN port; access restricted to this macOS user.
+        old_umask = os.umask(0o177)
+        try:
+            server = await asyncio.start_unix_server(handle, path=str(SOCKET), limit=1024)
+        finally:
+            os.umask(old_umask)
+        print("本地窗帘服务已启动", flush=True)
+        try:
+            async with server:
+                await server.serve_forever()
+        finally:
+            SOCKET.unlink(missing_ok=True)
+
+
+def request(command):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(240)
+        try:
+            client.connect(str(SOCKET))
+        except (FileNotFoundError, ConnectionRefusedError):
+            raise ValueError("本地窗帘服务未启动，请在 Mac 本地运行 siri-curtain serve") from None
+        client.sendall((command + "\n").encode())
+        with client.makefile("rb") as stream:
+            result = json.loads(stream.readline(8192))
+        if not result["ok"]:
+            raise ValueError(result["message"])
+        print(result["message"])
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Siri 窗帘控制")
+    parser.add_argument("command", choices=["open", "close", "status", "ensure-open", "serve"])
+    args = parser.parse_args()
+    if args.command == "ensure-open":
+        print(datetime.now().astimezone().isoformat(timespec="seconds"), flush=True)
+    try:
+        if args.command == "serve":
+            asyncio.run(serve())
+        else:
+            request(args.command)
+    except Exception as exc:
+        parser.exit(1, f"窗帘操作失败：{type(exc).__name__}: {exc}\n")
